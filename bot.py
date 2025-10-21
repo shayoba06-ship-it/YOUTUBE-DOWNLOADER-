@@ -7,7 +7,6 @@ import shutil
 import urllib.parse
 from aiohttp import ClientTimeout
 from aiogram import Bot, Dispatcher, types
-from aiogram.enums import ContentType
 from aiogram.filters import Command
 from aiogram.types import Message
 from flask import Flask
@@ -17,50 +16,37 @@ from dotenv import load_dotenv
 # --- Load environment variables ---
 load_dotenv()
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-API_KEY = os.environ.get("API_KEY")  # optional if API URL has embedded key
+API_KEY = os.environ.get("API_KEY")  # Just the key, no extra symbols
 PORT = int(os.environ.get("PORT", "8080"))
 
-if not BOT_TOKEN:
-    raise RuntimeError("Please set BOT_TOKEN environment variable")
+if not BOT_TOKEN or not API_KEY:
+    raise RuntimeError("Please set BOT_TOKEN and API_KEY environment variables correctly")
 
-# --- Logging ---
+# Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
 dp = Dispatcher()
 
-# --- Force join channel ---
+# Force join channel
 CHANNEL = "@backuphaiyaarh"
 
 async def is_member(chat_id: int, user_id: int, channel_username: str, bot):
-    """Check if user is a member of a channel."""
     try:
         member = await bot.get_chat_member(chat_id=channel_username, user_id=user_id)
-        if member.status in ["creator", "administrator", "member"]:
-            return True
-        return False
+        return member.status in ["creator", "administrator", "member"]
     except Exception:
         return False
 
-# --- Keep-alive Flask server for Replit ---
+# Flask keep-alive
 app = Flask("keepalive")
-
 @app.route("/")
 def home():
     return "Bot is alive!"
+Thread(target=lambda: app.run(host="0.0.0.0", port=PORT), daemon=True).start()
 
-def run_web():
-    app.run(host="0.0.0.0", port=PORT)
-
-Thread(target=run_web, daemon=True).start()
-
-# --- Helper functions ---
-async def fetch_json(session, url):
-    async with session.get(url, timeout=ClientTimeout(total=120)) as resp:
-        resp.raise_for_status()
-        return await resp.json()
-
+# Helper functions
 async def head_url(session, url):
     try:
         async with session.head(url, timeout=ClientTimeout(total=30)) as r:
@@ -76,17 +62,15 @@ async def stream_download(session, url, dest_path):
             async for chunk in r.content.iter_chunked(1024*64):
                 f.write(chunk)
 
-# --- Command Handlers ---
+# Command handlers
 @dp.message(Command(commands=["start", "help"]))
 async def cmd_start(message: Message):
     await message.reply(
-        f"Hi! Mujhe YouTube ka link bhejo aur mai API se video download kar ke dunga.\n\n"
-        f"<b>⚠️ Pehle aapko {CHANNEL} join karna hoga!</b>\n\n"
-        "Usage: paste a YouTube URL (https://www.youtube.com/watch?v=...)\n"
-        "Agar file bahut badi hui, toh mai direct download link bhej dunga."
+        f"Hi! Mujhe YouTube link bhejo aur mai video download kar ke dunga.\n\n"
+        f"⚠️ Pehle aapko {CHANNEL} join karna hoga!\n"
+        "Agar file bahut badi hui toh mai direct download link bhej dunga."
     )
 
-# --- Main message handler ---
 @dp.message()
 async def handle_message(message: Message):
     text = (message.text or "").strip()
@@ -105,12 +89,8 @@ async def handle_message(message: Message):
 
     await message.reply("Link mila — processing kar raha hoon... thoda intezar karo.")
 
-    # Build API request
-    base_api = "https://ytdownloder.anshapi.workers.dev/ytdown/v1"
-    params = {"url": text}
-    if API_KEY:
-        params["key"] = API_KEY
-    api_url = base_api + "?" + urllib.parse.urlencode(params, safe=":/&?=")
+    # Build API request with correct API key
+    api_url = f"https://ytdownloder.anshapi.workers.dev/ytdown/v1?key={API_KEY}&url={urllib.parse.quote(text)}"
     logger.info(f"Calling downloader API: {api_url}")
 
     try:
@@ -134,6 +114,7 @@ async def handle_message(message: Message):
                 if key in data and data[key]:
                     file_url = data[key]
                     break
+
             if not file_url and isinstance(data.get("formats"), list):
                 formats = data["formats"]
                 formats_sorted = sorted(formats, key=lambda f: int(f.get("filesize", 0) or 0), reverse=True)
@@ -148,8 +129,6 @@ async def handle_message(message: Message):
                 return
 
             await message.reply("Download link mil gaya. File size check kar raha hoon...")
-
-            # Check size
             size = await head_url(session, file_url)
             MAX_TELEGRAM_BYTES = 50 * 1024 * 1024  # 50MB approx
             if size is not None and size > MAX_TELEGRAM_BYTES:
@@ -158,13 +137,11 @@ async def handle_message(message: Message):
                 )
                 return
 
-            # Download and send
             tmp_dir = tempfile.mkdtemp(prefix="tgvid_")
             tmp_path = os.path.join(tmp_dir, "video.mp4")
             try:
                 await message.reply("File download kar raha hoon... (phir bhej dunga)")
                 await stream_download(session, file_url, tmp_path)
-
                 with open(tmp_path, "rb") as f:
                     await bot.send_document(chat_id=message.chat.id, document=f, caption="Yeh lo — downloaded video")
                 await message.reply("File bhej di gayi ✅")
@@ -178,11 +155,10 @@ async def handle_message(message: Message):
         logger.exception("Error processing download")
         await message.reply(f"Kuch error hua: {e}")
 
-# --- Run bot ---
+# Run bot
 if __name__ == "__main__":
     import asyncio
     from aiogram import Runner
-
     runner = Runner(dispatcher=dp, bot=bot)
     try:
         asyncio.run(runner.start_polling())
