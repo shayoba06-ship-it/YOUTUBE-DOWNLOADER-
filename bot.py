@@ -1,166 +1,129 @@
+# bot.py
 import os
-import asyncio
 import aiohttp
-import logging
+import asyncio
 import tempfile
 import shutil
+import logging
 import urllib.parse
 from aiohttp import ClientTimeout
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
-from aiogram.types import Message
 from flask import Flask
 from threading import Thread
-from dotenv import load_dotenv
 
-# --- Load environment variables ---
-load_dotenv()
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-API_KEY = os.environ.get("API_KEY")  # Just the key, no extra symbols
-PORT = int(os.environ.get("PORT", "8080"))
+# ---------------- CONFIG ----------------
+BOT_TOKEN = "8282905908:AAFCqaLfBYqQNgPpIHUAy816kjQ4KzVThNI"
+API_KEY_RAW = "anshapi=WT6WGGGHJW7WT53YYHWHHWH"  # full param as given
+CHANNEL = "@backuphaiyaarh"
+PORT = 8080
+MAX_TELEGRAM_BYTES = 50*1024*1024  # 50 MB
+# ----------------------------------------
 
-if not BOT_TOKEN or not API_KEY:
-    raise RuntimeError("Please set BOT_TOKEN and API_KEY environment variables correctly")
-
-# Logging
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("ytbot")
 
 bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
 dp = Dispatcher()
 
-# Force join channel
-CHANNEL = "@backuphaiyaarh"
-
-async def is_member(chat_id: int, user_id: int, channel_username: str, bot):
-    try:
-        member = await bot.get_chat_member(chat_id=channel_username, user_id=user_id)
-        return member.status in ["creator", "administrator", "member"]
-    except Exception:
-        return False
-
-# Flask keep-alive
+# ---------------- Keep-alive Flask ----------------
 app = Flask("keepalive")
 @app.route("/")
 def home():
     return "Bot is alive!"
 Thread(target=lambda: app.run(host="0.0.0.0", port=PORT), daemon=True).start()
 
-# Helper functions
-async def head_url(session, url):
+# ---------------- Helpers ----------------
+async def is_member(user_id):
+    try:
+        m = await bot.get_chat_member(chat_id=CHANNEL, user_id=user_id)
+        return m.status in ["member","administrator","creator"]
+    except:
+        return False
+
+async def get_head_size(session, url):
     try:
         async with session.head(url, timeout=ClientTimeout(total=30)) as r:
             size = r.headers.get("Content-Length")
             return int(size) if size and size.isdigit() else None
-    except Exception:
+    except:
         return None
 
-async def stream_download(session, url, dest_path):
+async def download_file(session, url, path):
     async with session.get(url, timeout=ClientTimeout(total=600)) as r:
         r.raise_for_status()
-        with open(dest_path, "wb") as f:
+        with open(path,"wb") as f:
             async for chunk in r.content.iter_chunked(1024*64):
                 f.write(chunk)
 
-# Command handlers
-@dp.message(Command(commands=["start", "help"]))
-async def cmd_start(message: Message):
-    await message.reply(
-        f"Hi! Mujhe YouTube link bhejo aur mai video download kar ke dunga.\n\n"
-        f"⚠️ Pehle aapko {CHANNEL} join karna hoga!\n"
-        "Agar file bahut badi hui toh mai direct download link bhej dunga."
-    )
+# ---------------- Handlers ----------------
+@dp.message(Command(commands=["start","help"]))
+async def start(message: types.Message):
+    await message.reply(f"Hi! Mujhe YouTube link bhejo aur mai download kar ke dunga.\n⚠️ Pehle {CHANNEL} join karna hoga!")
 
 @dp.message()
-async def handle_message(message: Message):
+async def handle_msg(message: types.Message):
     text = (message.text or "").strip()
     if not text:
         await message.reply("Koi URL bhejo pehle.")
         return
 
-    # Force join check
-    if not await is_member(message.chat.id, message.from_user.id, CHANNEL, bot):
-        await message.reply(f"⚠️ Pehle {CHANNEL} join karo tabhi video download kar paoge!\nJoin link: https://t.me/backuphaiyaarh")
+    if not await is_member(message.from_user.id):
+        await message.reply(f"⚠️ Pehle {CHANNEL} join karo!\nJoin link: https://t.me/{CHANNEL.lstrip('@')}")
         return
 
     if "youtube.com/watch" not in text and "youtu.be/" not in text:
-        await message.reply("Ye YouTube link nahi lag raha. Ek valid YouTube URL bhejo.")
+        await message.reply("Valid YouTube URL bhejo.")
         return
 
-    await message.reply("Link mila — processing kar raha hoon... thoda intezar karo.")
+    await message.reply("Processing...")
 
-    # Build API request with correct API key
-    api_url = f"https://ytdownloder.anshapi.workers.dev/ytdown/v1?key={API_KEY}&url={urllib.parse.quote(text)}"
-    logger.info(f"Calling downloader API: {api_url}")
+    api_url = f"https://ytdownloder.anshapi.workers.dev/ytdown/v1?{API_KEY_RAW}&url={urllib.parse.quote(text)}"
+    logger.info(f"Calling API: {api_url}")
 
     try:
-        timeout = ClientTimeout(total=120)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with aiohttp.ClientSession() as session:
             async with session.get(api_url) as resp:
+                body = await resp.text()
                 if resp.status != 200:
-                    text_body = await resp.text()
-                    await message.reply(f"API error: HTTP {resp.status}\nResponse: {text_body[:500]}")
+                    await message.reply(f"API error: HTTP {resp.status}\nPreview:\n{body[:500]}")
                     return
                 try:
                     data = await resp.json()
-                except Exception:
-                    text_body = await resp.text()
-                    await message.reply(f"API returned non-JSON. Preview:\n{text_body[:800]}")
+                except:
+                    await message.reply(f"API returned non-JSON response. Preview:\n{body[:800]}")
                     return
 
-            # Extract download URL
-            file_url = None
-            for key in ("download", "url", "link", "file", "video_url", "download_url"):
-                if key in data and data[key]:
-                    file_url = data[key]
-                    break
-
-            if not file_url and isinstance(data.get("formats"), list):
-                formats = data["formats"]
-                formats_sorted = sorted(formats, key=lambda f: int(f.get("filesize", 0) or 0), reverse=True)
-                for f in formats_sorted:
-                    candidate = f.get("url") or f.get("download")
-                    if candidate:
-                        file_url = candidate
-                        break
-
+            # get download URL
+            file_url = data.get("download") or data.get("url") or data.get("link")
             if not file_url:
-                await message.reply("API response me download link nahi mila. Response (short):\n" + str(data)[:800])
+                await message.reply("Download link nahi mila. Response preview:\n"+str(data)[:800])
                 return
 
-            await message.reply("Download link mil gaya. File size check kar raha hoon...")
-            size = await head_url(session, file_url)
-            MAX_TELEGRAM_BYTES = 50 * 1024 * 1024  # 50MB approx
-            if size is not None and size > MAX_TELEGRAM_BYTES:
-                await message.reply(
-                    "Ye file Telegram ke liye bahut badi hai. Direct download link: " + file_url
-                )
+            size = await get_head_size(session, file_url)
+            if size and size>MAX_TELEGRAM_BYTES:
+                await message.reply("File bahut badi hai. Direct link:\n"+file_url)
                 return
 
-            tmp_dir = tempfile.mkdtemp(prefix="tgvid_")
-            tmp_path = os.path.join(tmp_dir, "video.mp4")
-            try:
-                await message.reply("File download kar raha hoon... (phir bhej dunga)")
-                await stream_download(session, file_url, tmp_path)
-                with open(tmp_path, "rb") as f:
-                    await bot.send_document(chat_id=message.chat.id, document=f, caption="Yeh lo — downloaded video")
-                await message.reply("File bhej di gayi ✅")
-            finally:
-                try:
-                    shutil.rmtree(tmp_dir)
-                except Exception:
-                    pass
+            tmp_dir = tempfile.mkdtemp()
+            tmp_file = tmp_dir+"/video.mp4"
+            await message.reply("File download kar raha hoon...")
+            await download_file(session,file_url,tmp_file)
 
+            with open(tmp_file,"rb") as f:
+                await bot.send_document(chat_id=message.chat.id, document=f, caption="Yeh lo — downloaded video")
+            await message.reply("Done ✅")
+
+            shutil.rmtree(tmp_dir)
     except Exception as e:
-        logger.exception("Error processing download")
         await message.reply(f"Kuch error hua: {e}")
+        logger.exception("Error")
 
-# Run bot
-if __name__ == "__main__":
-    import asyncio
+# ---------------- Run ----------------
+if __name__=="__main__":
     from aiogram import Runner
     runner = Runner(dispatcher=dp, bot=bot)
     try:
         asyncio.run(runner.start_polling())
-    except (KeyboardInterrupt, SystemExit):
+    except (KeyboardInterrupt,SystemExit):
         print("Bot stopped")
